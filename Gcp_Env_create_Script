@@ -1,0 +1,32 @@
+## setting up configurations
+
+#install pdftotext
+#install mysql-server
+
+gcloud config set project audit-tie-out-tool
+gcloud config set compute/region australia-southeast1
+gcloud config set compute/zone australia-southeast1-b
+
+##creating IP address for the compute engine.
+gcloud compute --project audit-tie-out-tool addresses create auditaddress2 --region asia-east1
+
+##create compute instance
+INSTANCE_NAME=Audit_compute_instance1
+MACHINE_TYPE=n1-standard-2
+gcloud compute instances create ${INSTANCE_NAME} --machine-type=${MACHINE_TYPE}
+
+
+
+##working with cloudSQL DB
+#create instance.
+gcloud sql instances create <instance_name> --region=australia-southeast1  --authorized-networks= 10.142.0.2 --storage-auto-increase
+
+#creating a database inside a live instance.
+gcloud sql databases create [DATABASE_NAME] --instance=[INSTANCE_NAME]
+
+#to connect to cloudsql from compute compute_engine
+mysql --host=35.239.16.68 --user=root -p
+
+
+##open a SSH for compute engine from CLI
+ gcloud alpha cloud-shell ssh

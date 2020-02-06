@@ -1,0 +1,35 @@
+##install the tool to the compute engine
+sudo apt-get install -y poppler-utils
+
+#Defining the bucket name.
+Bucket_name=audit_storage_bucket1
+
+#switcing to the /tmp directory
+cd tmp
+
+#copy all the available PDF files from the landing directory(Bucket) to compute_engine for extraction.
+gsutil cp gs://${Bucket_name}/tmp/*.pdf .
+
+####Cleaning the file_naming
+#remove the extension ".pdf" from the file name.
+for i in *.pdf; do    mv "$i" "${i%.pdf}"; done
+
+#to replace space with "_" in file file_name
+for f in *\ *; do mv "$f" "${f// /_}"; done
+
+##to replace "." with "_" in file file_name
+for f in *\.*; do mv "$f" "${f//./_}"; done
+
+##add the ".pdf" extenstion to the file name.
+for f in *;do mv $f $f.pdf;done
+
+
+##extracting the text from pdf files in loop, saving the extracted file and source file back the bucket.
+for s in `ls *.pdf`; do pdftotext -layout $s; gsutil cp ${s%%.*}.txt gs://${Bucket_name}/extracted_text/$(date '+%Y-%m-%d-%H:%m')/; gsutil cp ${s%%.*}.pdf gs://${Bucket_name}/processed_files/$(date '+%Y-%m-%d-%H:%m')/; done
+
+##Flush the landing dir in the bucket.
+gsutil rm gs://${Bucket_name}/tmp/*.pdf
+
+##remove the file from tmp dir in compute_engine
+rm *.pdf
+rm *.txt
