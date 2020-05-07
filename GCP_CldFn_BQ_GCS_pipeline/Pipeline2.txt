@@ -1,0 +1,336 @@
+import base64
+import json
+import os
+import requests
+import base64
+import sys
+import string
+import time
+
+
+from google.api_core import retry
+from google.cloud import bigquery
+from google.cloud import firestore
+from google.cloud import pubsub_v1
+from datetime import datetime
+
+'''
+google-cloud-firestore==1.6.1
+google-cloud-pubsub==0.34.0
+google-cloud-storage==1.13.1
+google-cloud-bigquery==1.8.1
+google-cloud-core==0.29.1
+pytz==2018.7
+'''
+
+PROJECT_ID = os.getenv('GCP_PROJECT')
+
+# ---- FIRESTORE --------------------------
+
+FS_COLLECTION = "pipelines"
+FS_DOCUMENT = "pipeline-1"
+FS_FIELDS = ['00 - Google Form', '01 - PubSub message', '02 - BigQuery insert', '03 - BigQuery aggregation', '04 - BigQuery export', '05 - Anaplan import']
+
+# ---- CLOUD STORAGE --------------------------
+
+GCS_OUTPUT_PATH = "gs://{}/out/out.csv".format(PROJECT_ID)
+project_name = "au-ac-IFRS17"
+bucket_name = "au-ac-ifrs17"
+blob_name = "out/output.csv"   # storage target file name
+filename = 'output.csv'
+path = '/tmp/'
+current_timestamp = datetime.now().strftime('%Y%m%d')   # datetime.now().strftime('%Y%m%d_%H%M%S') # Used as file timestamp.
+
+# ---- PUB-SUB  -----------------------------
+publisher = pubsub_v1.PublisherClient()
+TOPIC_ID_LIST = 'insurance_lh_output_list'
+TOPIC_ID_DATA = 'insurance_lh_output_data'
+
+#Topic name: projects/au-ac-ifrs17-sandpit/topics/insurance_lh_output_list
+#Topic name: projects/au-ac-ifrs17-sandpit/topics/insurance_lh_output_data
+
+# The `topic_path` method creates a fully qualified identifier
+# in the form `projects/{project_id}/topics/{topic_name}`
+topic_path_list = publisher.topic_path(PROJECT_ID, TOPIC_ID_LIST)
+topic_path_data = publisher.topic_path(PROJECT_ID, TOPIC_ID_DATA)
+#TOPIC_NAME = 'projects/au-ac-ifrs17-sandpit/topics/qtest'
+
+# ---- BIG QUERY --------------------------
+
+client = bigquery.Client()
+
+BQ_DATASET = "insurance_demo"
+BQ_INPUT_TABLE = "lh_new"
+BQ_OUTPUT_TABLE = "lh_002_output"
+
+BQ_AGGREGATION_QUERY = """
+SELECT POL_YEAR, Channel, PROD_TYPE, Geography, AVG(ANNUAL_PREM) AS AVG_PREM, COUNT(POL_NUMBER) as Total_Policies
+FROM `{}.insurance_demo.in`
+Group by POL_YEAR, channel, geography, PROD_TYPE, ANNUAL_PREM
+order by POL_YEAR
+""".format(PROJECT_ID)
+
+## delete the existing Derivied table
+query_00 = """
+DELETE FROM `au-ac-ifrs17-sandpit.insurance_demo.insurance_lh_001_derived` WHERE true;
+"""
+
+## insert data to derived table 
+
+query_01 = """
+Insert into `au-ac-ifrs17-sandpit.insurance_demo.insurance_lh_001_derived`
+Select
+  lh.policy_code
+  ,lh.product
+  ,lh.claim_type
+  ,lh.policy_start_date
+  ,lh.policy_end_date
+  ,lh.dob
+  ,lh.address_street
+  ,lh.address_state
+  ,lh.address_country
+  ,lh.address_postcode
+  ,lh.annual_premium
+  ,FORMAT_DATE("%Y-%m", policy_start_date) as Period
+  ,(CASE 
+    WHEN EXTRACT( MONTH from policy_start_date ) >=7 THEN CONCAT('FY',EXTRACT( YEAR from policy_start_date ) - 2000 )
+    ELSE CONCAT('FY',EXTRACT( YEAR from policy_start_date ) - 2001)
+    END) as FY
+  ,(CASE
+    WHEN lh.product LIKE 'Level Term' THEN 'BBA_LT'
+    WHEN lh.product LIKE 'Decreasing Term' THEN 'BBA_DT'
+    WHEN lh.product LIKE 'Traditional Whole Life' THEN 'BBA_TWL'
+    WHEN lh.product LIKE 'Universal Life' THEN 'VFA_UL'
+    WHEN lh.product LIKE 'Variable Universal Life' THEN 'VFA_VUL'
+    WHEN lh.product LIKE 'Annuity' THEN 'VFA_DA'
+    ELSE 'BBA_UNK'
+    END) as INC
+   ,(CASE 
+      WHEN lh.claim_type LIKE 'Death Benefit' THEN 'Death'
+      WHEN lh.claim_type LIKE 'Disability Benefit' THEN 'Disability'
+      ELSE 'Unknown'
+      END) as CT
+   ,(CASE
+      WHEN lh.address_country LIKE 'Australia' THEN 'AU'
+      WHEN lh.address_country LIKE 'United Kingdom' THEN 'UK'
+      WHEN lh.address_country LIKE 'France' THEN 'FR'
+      WHEN lh.address_country LIKE 'Spain' THEN 'SP'
+      WHEN lh.address_country LIKE 'Hong Kong' THEN 'HK'
+      WHEN lh.address_country LIKE 'Belgium' THEN 'BE'
+      WHEN lh.address_country LIKE 'Sweden' THEN 'SE'
+      ELSE 'UNK'
+      END) as G
+From
+  `au-ac-ifrs17-sandpit.insurance_demo.insurance_lh_new` lh ;
+"""
+
+## delete the existing Output table
+query_02 = """
+DELETE FROM `au-ac-ifrs17-sandpit.insurance_demo.insurance_lh_002_output` WHERE true;
+"""
+
+## Load the output table
+query_03 = """
+INSERT INTO `au-ac-ifrs17-sandpit.insurance_demo.insurance_lh_002_output`
+Select
+  'Number of Policies' as LineItem
+  ,'Actual' as Version
+  ,'Inception' as PoC
+  ,'via P&L' as PL
+  ,CONCAT(lhd.INC, ' - ', lhd.CT, ' - ', lhd.G, '-', lhd.FY) as INxCTxGxUY
+  ,lhd.period
+  ,count(*) as Value
+From
+  `au-ac-ifrs17-sandpit.insurance_demo.insurance_lh_001_derived` lhd
+Group By 5,6;
+"""
+
+## delete the existing Output LIST table
+query_04 = """
+DELETE FROM `au-ac-ifrs17-sandpit.insurance_demo.insurance_lh_003_list_output` WHERE true;
+"""
+
+## Load Output LIST table
+query_05 = """
+INSERT INTO `au-ac-ifrs17-sandpit.insurance_demo.insurance_lh_003_list_output`
+Select
+  CONCAT(lhd.INC, ' - ', lhd.CT, ' - ', lhd.G, '-', lhd.FY) as Blank_Name
+  ,CONCAT(lhd.INC, ' - ', lhd.CT, ' - ', lhd.G) as Parent
+  ,CONCAT(lhd.INC, ' - ', lhd.CT, ' - ', lhd.G, '-', lhd.FY) as Code
+  ,(CASE
+      WHEN lhd.INC LIKE '%BBA%' THEN 'TRUE'
+      ELSE 'FALSE'
+      END) as UOA_BBA
+  ,(CASE
+      WHEN lhd.INC LIKE '%VFA%' THEN 'TRUE'
+      ELSE 'FALSE'
+      END) as UOA_VFA
+  ,lhd.product as INC
+  ,lhd.claim_type as Claim_Type
+  ,lhd.G as Geography
+  ,(CASE 
+    WHEN EXTRACT( MONTH from policy_start_date ) >=7 THEN CAST(EXTRACT( YEAR from policy_start_date ) as string)
+    ELSE CAST(EXTRACT( YEAR from policy_start_date ) as string)
+    END) as Underwriting_Year
+  ,CONCAT(lhd.INC, ' - ', lhd.CT, ' - ', lhd.G, ' - ', lhd.FY) as Display_Name
+  ,lhd.FY as Initiation_Year
+From
+  `au-ac-ifrs17-sandpit.insurance_demo.insurance_lh_001_derived` lhd
+Group By 1,2,3,4,5,6,7,8,9,10,11;
+"""
+
+
+# ==============================================================
+# FIRE STORE (FS) 
+# FS related functions. 
+# ==============================================================    
+
+class Firestore(object):
+    
+    def __init__(self):
+        self.db = firestore.Client()
+        self.doc_ref = self.db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+
+    def update(self, pipeline_index):
+        field_updates = { FS_FIELDS[pipeline_index]: firestore.SERVER_TIMESTAMP }
+        self.doc_ref.update(field_updates)
+
+fs = Firestore()
+
+
+# ==============================================================
+# BIG QUERY (BQ) 
+# BQ related functions. 
+# ==============================================================
+
+# Write the PubSub record into BQ table.
+def write_rows(rows):
+    fs.update(2) # BQ Data Insert 
+    table = client.dataset(BQ_DATASET).table(BQ_INPUT_TABLE)
+    return client.insert_rows_json(table, json_rows=rows,
+                                   retry=retry.Retry(deadline=30))
+    #return []
+
+'''
+# Do the aggregation. NOT REQUIRED 
+def run_aggregation():
+    fs.update(3)
+    job_config = bigquery.QueryJobConfig()
+    table = client.dataset(BQ_DATASET).table(BQ_OUTPUT_TABLE)
+    job_config.destination = table
+    job_config.write_disposition = bigquery.WriteDisposition.WRITE_TRUNCATE
+    job = client.query(BQ_AGGREGATION_QUERY, job_config=job_config)
+    rows = list(job)
+'''
+
+'''    
+# Export BQ data to Cloud Storage. NOT REQUIRED
+def export_to_gcs():
+    fs.update(4) # BQ data export 
+    destination_uri = GCS_OUTPUT_PATH
+    table = client.dataset(BQ_DATASET).table(BQ_OUTPUT_TABLE)
+    extract_job = client.extract_table(table, destination_uri)
+    extract_job.result()  # Waits for job to complete
+'''
+
+# ==============================================================
+# PUBSUB 
+# ==============================================================
+
+# https://stackoverflow.com/questions/53645432/implementing-a-cloud-function-to-publish-to-pubsub-triggered-by-gcs-finalize
+# https://stackoverflow.com/questions/52871343/writing-to-pub-sub-from-cloud-functions
+# https://medium.com/@chandrapal/creating-a-cloud-function-to-publish-messages-to-pub-sub-154c2f472ca3
+
+#TOPIC_ID_LIST = 'insurance_lh_output_list'
+#TOPIC_ID_DATA = 'insurance_lh_output_data'
+#topic_path_list = publisher.topic_path(PROJECT_ID, TOPIC_ID_LIST)
+#topic_path_data = publisher.topic_path(PROJECT_ID, TOPIC_ID_DATA)
+
+# Publish a message 
+#def publish_message(request):
+def publish_message():  
+  data = u'Message Published at: {}'.format(current_timestamp)
+  data = data.encode('utf-8') # Data must be a bytestring
+
+  # Publish message for LIST topic. 
+  future = publisher.publish(topic_path_list, data=data)
+  print('Published in Topic: {} | Content: {} | Message ID: {}.'.format(TOPIC_ID_LIST, data, future.result()))
+  #print('Published messages.')
+
+  time.sleep(15)  # Wait for 15 seconds. 
+
+  # Publish message for DATA topic. 
+  future = publisher.publish(topic_path_data, data=data)
+  print('Published in Topic: {} | Content: {} | Message ID: {}.'.format(TOPIC_ID_DATA, data, future.result()))
+
+
+'''
+for n in range(1, 10):
+    data = u'Message number {}'.format(n)
+    # Data must be a bytestring
+    data = data.encode('utf-8')
+    # When you publish a message, the client returns a future.
+    future = publisher.publish(topic_path, data=data)
+    print('Published {} of message ID {}.'.format(data, future.result()))
+
+print('Published messages.')
+'''
+
+# ==============================================================
+# MAIN Function. 
+# Triggered by the PubSub Topic
+# ==============================================================
+
+def stream(event, context):
+    """Triggered from a message on a Cloud Pub/Sub topic.
+    Args:
+         event (dict): Event payload.
+         context (google.cloud.functions.Context): Metadata for the event.
+    """
+
+    fs.update(0) # Google Form submitted. 
+    fs.update(1) # PubSub message inserted.
+
+    # Read PubSub Message.  
+    pubsub_message = base64.b64decode(event['data']).decode('utf-8')
+    print (pubsub_message)
+    row = json.loads(pubsub_message)
+
+    # Write that PubSub message into BQ Table. 
+    errors = write_rows([row])
+
+    if errors == []:
+        #run_aggregation()
+        # Skip this, output already saved in table
+        
+        #Delete derived table        
+        query_job_00 = client.query(query_00)
+        query_job_00.result()
+
+        #load to derived table        
+        query_job_01 = client.query(query_01)
+        query_job_01.result()
+
+        #Delete from output table        
+        query_job_02 = client.query(query_02)
+        query_job_02.result()
+
+        #load to Output table        
+        query_job_03 = client.query(query_03)
+        query_job_03.result()
+
+        #Delete from output_list table        
+        query_job_04 = client.query(query_04)
+        query_job_04.result()
+
+        #load to output_list table        
+        query_job_05 = client.query(query_05)
+        query_job_05.result()
+
+        publish_message() # Publish a message in qtest topic. 
+
+        
+    else:
+        print(errors)
+ 
+

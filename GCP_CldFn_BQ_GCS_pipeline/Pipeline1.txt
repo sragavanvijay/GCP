@@ -1,0 +1,388 @@
+import base64
+import json
+import os
+import requests
+import base64
+import sys
+import string
+
+
+from google.api_core import retry
+from google.cloud import bigquery
+from google.cloud import firestore
+from google.cloud import storage
+
+'''
+# Requirements.txt ---
+google-cloud-firestore==1.6.1
+google-cloud-pubsub==0.34.0
+google-cloud-storage==1.13.1
+google-cloud-bigquery==1.8.1
+google-cloud-core==0.29.1
+pytz==2018.7
+'''
+
+# --------- Global Configs -----------
+PROJECT_ID = os.getenv('GCP_PROJECT')
+
+# -------- BIG QUERY  ---------------
+
+# Store data in BigQuery coming through Form -> PubSub
+BQ_DATASET = "insurance_demo"
+#BQ_INPUT_TABLE = "lh_new"
+BQ_OUTPUT_TABLE = "lh_002_output"  # Data
+
+
+# -------- FIRESTORE  ---------------
+
+# To store Last Action Datetime for each Pipeline Action Item. Key-Value pair.
+FS_COLLECTION = "pipelines"
+FS_DOCUMENT = "pipeline-1"
+FS_FIELDS = ['00 - Google Form', '01 - PubSub message', '02 - BigQuery insert', '03 - BigQuery aggregation', '04 - BigQuery export', '05 - Anaplan import', '06 - Export', '07 - Import to Anaplan']
+
+# ---------- ANAPLAN  ---------------
+
+wGuid = 'xxxxxxxxxxx' # workspace Guid
+mGuid = 'yyyyyyyyy' # model Guid
+username = 'xxxxxxxxxxxx' # Anaplan account email being used
+
+
+# --------- STORAGE  ----------------
+
+# Storing the output file
+PROJECT_NAME = "au-ac-IFRS17"
+BUCKET_NAME = "au-ac-ifrs17"
+BLOB_NAME = "out/Data_Cash.csv"   # storage target file name
+FILENAME = 'Data_Cash .csv'
+GCS_OUTPUT_PATH = "gs://{}/{}".format(PROJECT_ID, BLOB_NAME)
+#GCS_OUTPUT_PATH = "gs://{}/out/xxxx.csv".format(PROJECT_ID)
+
+
+# --------- LOCAL Storage  ----------------
+PATH = '/tmp/'  # local temp storage for functions.
+PATH_TO_FILE = PATH + FILENAME
+
+
+
+# ---------------------------------------------------------------------------
+# To store the Last Action datetime. For example: 06 - Export: 30 March 2020 at 11:17:48 UTC+11
+
+class FireStore(object):
+
+    def __init__(self):
+        self.db = firestore.Client()
+        self.doc_ref = self.db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+
+    def update(self, pipeline_index):
+        print("FireStore: Update datetime for action item: {}".format(FS_FIELDS[pipeline_index]))
+        field_updates = { FS_FIELDS[pipeline_index]: firestore.SERVER_TIMESTAMP }
+        self.doc_ref.update(field_updates)
+
+
+# ---------------------------------------------------------------------------
+# BigQuery related operations. like: export_to_gcs(), execute_sql(), insert/update/delete() ..etc
+
+class BigQuery():
+
+    def __init__(self):
+        self.db = bigquery.Client()
+        self.table = self.db.dataset(BQ_DATASET).table(BQ_OUTPUT_TABLE)
+        #client = bigquery.Client()
+
+    def export_to_gcs(self):
+        print("BigQuery: Exporting from table: {} - to Storage: {}".format(BQ_OUTPUT_TABLE, GCS_OUTPUT_PATH))
+        destination_uri = GCS_OUTPUT_PATH
+        #table = self.db.dataset(BQ_DATASET).table(BQ_OUTPUT_TABLE)
+        #table = client.dataset(BQ_DATASET).table(BQ_OUTPUT_TABLE)
+        job_config = bigquery.job.ExtractJobConfig(print_header=False)
+        extract_job = self.db.extract_table(self.table, destination_uri, job_config=job_config)
+        extract_job.result()  # Waits for job to complete
+
+
+# ---------------------------------------------------------------------------
+# Cloud Storage related operations. Get/put/delete files.
+# https://stackoverflow.com/questions/37003862/google-cloud-storage-how-to-upload-a-file-from-python-3
+
+class CloudStorage():
+
+    def __init__(self):
+        self.storage_client = storage.Client(project=PROJECT_NAME)
+
+    def get_file(self):
+        bucket = self.storage_client.get_bucket(BUCKET_NAME)
+        blob = bucket.blob(BLOB_NAME)
+        blob.download_to_filename(PATH_TO_FILE)
+        print("CloudStorage: Downloading Blob {} to local {}.".format(BLOB_NAME, PATH_TO_FILE))
+
+    '''
+    def storage_put_file(project_name, bucket_name, blob_name, path_to_file):
+        #client = storage.client()
+        #bucket = client.get_bucket(bucket_name)
+        # Explicitly use service account credentials by specifying the private keyfile.
+        #storage_client = storage.Client.from_service_account_json('creds.json')
+        storage_client = storage.Client(project=project_name)
+        #print(buckets = list(storage_client.list_buckets())
+
+        bucket = storage_client.get_bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        # blob = Blob(blob_name, bucket)
+        blob.upload_from_filename(path_to_file)
+        # blob.upload_from_file(path + filename)
+        print("Uploading {} to storage Blob {}.".format(path_to_file, blob_name))
+
+        #returns a public url
+        #return blob.public_url
+    '''
+
+# ---------------------------------------------------------------------------
+# Local storage related operations.
+# https://cloud.google.com/functions/docs/bestpractices/tips#always_delete_temporary_files
+
+class LocalStorage():
+
+    def delete_file(self):
+        #file_path = path + filename   # /tmp/tempfile
+        if os.path.exists(PATH_TO_FILE):
+            try:
+                os.remove(PATH_TO_FILE)
+                message = 'LocalStorage: File is deleted -' + PATH_TO_FILE
+            except Exception as e:
+                message = 'LocalStorage: Can not delete file - ' + PATH_TO_FILE
+        else:
+            message = 'LocalStorage: Delete fail. File not found - ' + PATH_TO_FILE
+
+        print(message)
+
+
+    # Local File: Read file from /tmp directory
+    def read_file(self):
+        #file_path = path + filename   # /tmp/tempfile
+        if os.path.exists(PATH_TO_FILE):
+            try:
+                #with open(file_path, 'rb') as f:
+                with open(PATH_TO_FILE, 'r') as f:
+                    content = f.read()
+                    message = 'LocalStorage: Reading from file - ' + PATH_TO_FILE
+
+            except Exception as e:
+                message = 'LocalStorage: Failed to read from file - ' + PATH_TO_FILE
+                print(e)
+                content = ''
+        else:
+            message = 'LocalStorage: Read failure. File not found - ' + PATH_TO_FILE
+
+        print(message)
+        print(content)
+
+
+    '''
+    def write_file(path, filename, content):
+        file_path = path + filename   # /tmp/tempfile
+        os.makedirs(os.path.dirname(file_path), exist_ok=True) #  make sure dir exist
+        try:
+            #with open(file_path, 'wb') as f:
+            with open(file_path, 'w') as f:
+                f.write(content)
+                message = 'Success: Write to file:' + file_path
+        except Exception as e:
+            message = 'Failed: Write to file:' + file_path
+            print(e)
+        print(message)
+
+    '''
+
+
+# ---------------------------------------------------------------------------
+# ANAPLAN related operations:
+
+class Anaplan():
+
+    def __init__(self):
+        self.password = '@###@@@!@@@'
+        self.user = 'Basic ' + str(base64.b64encode((f'{username}:{self.password}').encode('utf-8')).decode('utf-8'))
+        self.filedata_id = '113000000050' # existing ID
+        #'113000000044' # new ID . for import, this is ImportDataSourceId.
+        self.importdata_id = '112000000062' # existing:  "name" : GCP POC IM 02T. Data_Cash Flows_Prophet - TEST
+        self.import_name = 'GCP POC IM 03T. Data_Cash Flows_Prophet - TEST' #'GCP Demo - Import ' + FILENAME + '-2020-04-09'
+
+    def find_id(self):
+        '''
+        # https://stackoverflow.com/questions/45414082/the-fastest-method-to-find-element-in-json-python
+        def function(json_object, name):
+        return [obj for obj in json_object if obj['name']==name][0]['price']
+        '''
+        pass
+
+    def import_file(self):
+
+        print("Anaplan: Importing file. Data Source id: {} - Name: {}".format(self.filedata_id, self.import_name))
+
+        importData = {
+          'id' : self.importdata_id,
+          'name' : self.import_name,
+          'importDataSourceId' : self.filedata_id,
+          'importType' : 'MODULE_DATA'
+        }
+
+        '''
+        # Import into the data
+        importData2 = {
+          "id" : "112000000056",
+          "name" : "Data_Cash Flows_Prophet from Data_Cash Flows_Prophet - TEST.",
+          "importDataSourceId" : "113000000047",
+          "importType" : "MODULE_DATA"
+        }
+        '''
+        url = (f'https://api.anaplan.com/1/3/workspaces/{wGuid}/models/{mGuid}/' +
+               f'imports/{importData["id"]}/tasks')
+
+        postHeaders = {
+            'Authorization': self.user,
+
+            'Content-Type': 'application/json'
+        }
+
+        # Runs an import request, and returns task metadata to 'postImport.json'
+        print(url)
+        postImport = requests.post(url,
+                                   headers=postHeaders,
+                                   data=json.dumps({'localeName': 'en_US'}))
+
+        print(postImport.status_code)
+        '''
+        with open('postImport.json', 'wb') as f:
+            f.write(postImport.text.encode('utf-8'))
+        '''
+
+        '''
+        getHeaders = {
+            'Authorization': user
+        }
+
+        getActions = requests.get(f'https://api.anaplan.com/1/3/workspaces/{wGuid}/' +
+                            f'models/{mGuid}/actions',
+                            headers=getHeaders)
+
+        # Print the output
+        print(getActions.text.encode('utf-8'))
+
+        #with open('actions.json', 'wb') as f:
+        #    f.write(getActions.text.encode('utf-8'))
+        '''
+
+    def upload_file(self):   # uploadSingleChunk
+
+        print("Anaplan: Uploading file {}".format(PATH_TO_FILE))
+        # Replace with your file metadata
+        # name = Should we use the filename. or full file path.
+        fileData = {
+            "id" : self.filedata_id,
+            "name" : PATH_TO_FILE,
+            "chunkCount" : 0,
+            "delimiter" : "\"",
+            "encoding" : "ISO-8859-1",
+            "firstDataRow" : 2,
+            "format" : "txt",
+            "headerRow" : 1,
+            "separator" : ","
+        }
+        '''
+        fileData = {
+            "id" : "113000000044",
+            "name" : PATH_TO_FILE,
+            "chunkCount" : 0,
+            "delimiter" : "\"",
+            "encoding" : "ISO-8859-1",
+            "firstDataRow" : 2,
+            "format" : "txt",
+            "headerRow" : 1,
+            "separator" : ","
+        }
+        '''
+
+        url = (f'https://api.anaplan.com/1/3/workspaces/{wGuid}/models/{mGuid}/' +
+            f'files/{fileData["id"]}')
+
+        putHeaders = {
+            'Authorization': self.user,
+            'Content-Type': 'application/octet-stream'
+        }
+
+        # Download the file from GCS to local
+
+        # Opens the data file (filData['name'] by default) and encodes it to utf-8
+        dataFile = open(fileData['name'], 'r').read().encode('utf-8')
+
+
+        # ----- We don't need this if we add the Header in Big Query sql ------------
+        # Attach the header row:
+        header_record = "Line Item,Version,Points of Change,P&L or CSM,#IN x CT x G x UY,Period,Value"
+
+        dataFile2 = b"\n".join([str(header_record).encode('utf-8'),dataFile])
+        print("Anaplan: Header added to DataFile.")
+        #print(dataFile2.decode("utf-8"))
+        # -------------------------------------------
+
+        fileUpload = requests.put(url,
+                                headers=putHeaders,
+                                data=(dataFile2))
+
+        #resultFile = open(fileData['outputname'], 'w') # why do we need Outputname ?
+        #resultFile.write(dataFile2.decode("utf-8")) # we don't need these as we will not store the file in /tmp
+
+        if fileUpload.ok:
+            print('Anaplan: File Upload Successful. Output: {}'.format(fileUpload))
+        else:
+            print('Anaplan: There was an issue with your file upload: '
+                + str(fileUpload.status_code))
+
+
+# ---------- MAIN PROGRAM -------------------------------------
+def hello_pubsub(event, context):
+    """Triggered from a message on a Cloud Pub/Sub topic.
+    Args:
+         event (dict): Event payload.
+         context (google.cloud.functions.Context): Metadata for the event.
+    """
+
+    # Instance create
+    bq = BigQuery()
+    fs = FireStore()
+    ap = Anaplan()
+    cs = CloudStorage()
+    ls = LocalStorage()
+
+    pubsub_message = base64.b64decode(event['data']).decode('utf-8')
+    print("PubSub: Message content: {}".format(pubsub_message))
+    #row = json.loads(pubsub_message)
+
+    # Execute the steps to push to Anaplan
+
+    # 1. Export data from BigQuery table to csv file on Cloud Storage - DONE
+    fs.update(6) #Firestore - action datetime update for 06 - export.
+    bq.export_to_gcs()
+
+    # 2. Retrieve the file from GCS to local,
+    cs.get_file()
+
+    # temp checking content
+    ls.read_file()
+
+
+    # TO-DO: get file list to Fetch metadata. * * *
+
+    # 3. add headers (in local /tmp),  - We can add that at BigQuery sql level. Done at #4
+
+    # 4. upload to Anaplan
+    # ---> ap.upload_file()
+    ap.upload_file()
+    # uploadSingleChunk()
+
+    # TO-DO: get file list to see metadata.
+
+    # 5. import to anaplan
+    fs.update(7)
+    ap.import_file()
+
+    # Must delete local file.
+    ls.delete_file()
